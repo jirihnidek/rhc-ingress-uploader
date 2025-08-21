@@ -1,0 +1,107 @@
+#!/bin/bash
+
+# /usr/libexec/rhc-ingress-uploader
+
+VERSION=0.1
+
+SERVER="http://localhost:3000/api/ingress/v1/upload"
+
+CONTENT_TYPE="application/vnd.redhat.advisor.tgz"
+
+if [[ $1 = "--help" ]]; then
+	echo "NAME:"
+	echo "   $0 - rhc ingress uploader"
+	echo ""
+	echo "USAGE:"
+	echo "   $0 [options] DIRECTORY_WITH_COLLECTED_DATA"
+	echo "   $0 [global options]"
+	echo ""
+	echo "VERSION:"
+	echo "   ${VERSION}"
+	echo ""
+	echo "DESCRIPTION:"
+	echo "   It uploads archive to Ingress server"
+	echo ""
+	echo "OPTIONS:"
+	echo "   --server <INGRESS_SERVER_URL>"
+	echo ""
+	echo "GLOBAL OPTIONS:"
+	echo "   --help     show help"
+	echo "   --version  print version"
+	exit 0
+fi
+
+if [[ $1 = "--version" ]]; then
+	echo "${VERSION}"
+	exit 0
+fi
+
+echo "working in directory '${PWD}'" | systemd-cat -t "rhc-ingress-uploader" -p "debug" 
+
+COLLECTION_DIR="${@: -1}"
+
+DIR_NAME=$(basename -- "${COLLECTION_DIR}")
+
+ARCHIVE_NAME="${DIR_NAME}.tar"
+
+# Run "archiver" part
+if [[ ! -d "${COLLECTION_DIR}" ]]; then
+	echo "${COLLECTION_DIR} is not directory" | systemd-cat -t "rhc-ingress-uploader" -p "err"
+	exit 1
+fi
+
+echo "adding directory '${COLLECTION_DIR}' to archive ${PWD}/${ARCHIVE_NAME} ..." | systemd-cat -t "rhc-ingress-uploader" -p "debug"
+tar -cf ${PWD}/${ARCHIVE_NAME} ${COLLECTION_DIR}
+if [[ $? -ne 0 ]]; then
+	echo "unable to add ${COLLECTION_DIR} to ${PWD}/${ARCHIVE_NAME}" | systemd-cat -t "rhc-ingress-uploader" -p "err"
+	exit 1
+fi
+
+echo "compresing archive '${PWD}/${ARCHIVE_NAME}' to '${PWD}/${ARCHIVE_NAME}.gz' ..." | systemd-cat -t "rhc-ingress-uploader" -p "debug"
+gzip -f ${PWD}/${ARCHIVE_NAME}
+if [[ $? -ne 0 ]]; then
+	echo "failed to compress ${PWD}/${ARCHIVE_NAME}" | systemd-cat -t "rhc-ingress-uploader" -p "err"
+	exit 1
+fi
+
+ARCHIVE_PATH="${PWD}/${ARCHIVE_NAME}.gz"
+
+echo "uploading archive ${ARCHIVE_PATH} to ${SERVER}" | systemd-cat -t "rhc-ingress-uploader" -p "debug"
+
+# Run "uploader" part
+
+# Create some magic numbers from output of subscription-manager
+# There is D-Bus method allowing to access consumer UUID, but there
+# is not D-Bus method returning current organization ID nor name
+
+subscription-manager status > /dev/null
+if [[ $? -eq 0 ]]; then
+	ACCOUNT_NUMBER=`subscription-manager identity | grep "system identity" | cut -d":" -f2 | xargs`
+	ORG_ID=`subscription-manager identity | grep "org ID" | cut -d":" -f2 | xargs`
+else
+	echo "system not registered" | systemd-cat -t "rhc-ingress-uploader" -p "err"
+	exit 1
+fi
+
+ACCOUNT_TYPE="basic"
+
+# Generate identity from magic numbers
+IDENTITY=`echo "{\"identity\": {\"account_number\": \"${ACCOUNT_NUMBER}\", \"internal\": {\"org_id\": \"${ORG_ID}\"}, \"type\": \"${ACCOUNT_TYPE}\"}}" | base64 -w 0`
+
+# Generate unique request ID
+REQUEST_ID=`uuidgen`
+
+# Use it all for uploading archive to locally deployed Ingress
+curl -v -F "file=@${ARCHIVE_PATH};type=${CONTENT_TYPE}" \
+	-H "x-rh-identity: ${IDENTITY}" \
+	-H "x-rh-insights-request-id: ${REQUEST_ID}" \
+	${SERVER} > curl_stdout 2> curl_stderr
+
+if [[ $? -eq 0 ]]; then
+	echo "{\"target\":\"${SERVER}\"}"
+	exit 0
+else
+	echo "failed to upload ${ARCHIVE_NAME} to ${SERVER}" | systemd-cat -t "rhc-ingress-uploader" -p "err"
+	exit 1
+fi
+
